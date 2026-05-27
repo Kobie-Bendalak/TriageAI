@@ -16,10 +16,38 @@ import (
 	"text/template"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"gopkg.in/yaml.v3"
 )
 
 var Version = "dev"
+
+// ── Prometheus metrics ────────────────────────────────────────────────────────
+
+var (
+	metricErrorsCaught = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "triageai_errors_caught_total",
+		Help: "Total log lines matching error filters, by repo and service.",
+	}, []string{"repo", "service"})
+
+	metricDispatches = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "triageai_dispatches_total",
+		Help: "Total repair dispatches, by repo, service and tier (tier0/tier1/tier2).",
+	}, []string{"repo", "service", "tier"})
+
+	metricDispatchDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "triageai_dispatch_duration_seconds",
+		Help:    "Time from error detection to dispatch completion.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"repo", "tier"})
+
+	metricLastDispatch = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "triageai_last_dispatch_timestamp",
+		Help: "Unix timestamp of the most recent dispatch, by repo and service.",
+	}, []string{"repo", "service"})
+)
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -29,13 +57,13 @@ type PatternAction struct {
 }
 
 type DispatchConfig struct {
-	Patterns         []PatternAction `yaml:"patterns"`
-	IntentURL        string          `yaml:"intent_url"`
-	AgentCmd         string          `yaml:"agent_cmd"`
-	DebounceSecs     int             `yaml:"debounce_secs"`
-	MinIntervalSecs  int             `yaml:"min_interval_secs"`
-	EscalateAfterSecs int            `yaml:"escalate_after_secs"`
-	DryRun           bool            `yaml:"dry_run"`
+	Patterns          []PatternAction `yaml:"patterns"`
+	IntentURL         string          `yaml:"intent_url"`
+	AgentCmd          string          `yaml:"agent_cmd"`
+	DebounceSecs      int             `yaml:"debounce_secs"`
+	MinIntervalSecs   int             `yaml:"min_interval_secs"`
+	EscalateAfterSecs int             `yaml:"escalate_after_secs"`
+	DryRun            bool            `yaml:"dry_run"`
 }
 
 type NotificationsConfig struct {
@@ -125,7 +153,7 @@ type Monitor struct {
 	matchRe      *regexp.Regexp
 	skipRes      []*regexp.Regexp
 	patternRes   []*regexp.Regexp
-	seen         map[string]time.Time // fingerprint → last dispatch
+	seen         map[string]time.Time
 	lastDispatch time.Time
 	mu           sync.Mutex
 	tmpl         *template.Template
@@ -219,13 +247,17 @@ func (m *Monitor) throttled() bool {
 // ── Tiered dispatch ───────────────────────────────────────────────────────────
 
 func (m *Monitor) dispatch(bucket *ErrorBucket) {
+	start := time.Now()
 	joined := strings.Join(bucket.Lines, "\n")
 
 	// Tier 0 — pattern match → shell action
 	for i, r := range m.patternRes {
 		if r.MatchString(joined) {
+			tier := "tier0"
 			action := m.cfg.Dispatch.Patterns[i].Action
 			fmt.Printf("[triage] Tier-0 pattern match %q → %s\n", m.cfg.Dispatch.Patterns[i].Match, action)
+			metricDispatches.WithLabelValues(m.repo.Name, bucket.Service, tier).Inc()
+			metricLastDispatch.WithLabelValues(m.repo.Name, bucket.Service).SetToCurrentTime()
 			if !m.cfg.Dispatch.DryRun {
 				cmd := exec.Command("sh", "-c", action)
 				cmd.Dir = m.repo.Path
@@ -236,6 +268,7 @@ func (m *Monitor) dispatch(bucket *ErrorBucket) {
 				}
 				m.notify(summary, "warn")
 			}
+			metricDispatchDuration.WithLabelValues(m.repo.Name, tier).Observe(time.Since(start).Seconds())
 			return
 		}
 	}
@@ -260,20 +293,17 @@ func (m *Monitor) dispatch(bucket *ErrorBucket) {
 		return
 	}
 
-	// Tier 1/2 classification via intent endpoint
 	tier := m.classifyTier(joined)
-
 	if tier == 1 {
-		m.runTier1(bucket, prompt)
+		m.runTier1(bucket, prompt, start)
 	} else {
-		m.runTier2(bucket, prompt)
+		m.runTier2(bucket, prompt, start)
 	}
 }
 
 func (m *Monitor) classifyTier(errorText string) int {
 	intentURL := m.cfg.Dispatch.IntentURL
 	if intentURL == "" {
-		// Default: short errors → Tier 1, long multi-line → Tier 2
 		if strings.Count(errorText, "\n") <= 3 {
 			return 1
 		}
@@ -283,13 +313,12 @@ func (m *Monitor) classifyTier(errorText string) int {
 	payload, _ := json.Marshal(map[string]string{"text": errorText})
 	resp, err := m.httpClient.Post(intentURL, "application/json", bytes.NewReader(payload))
 	if err != nil || resp.StatusCode != 200 {
-		return 1 // fail open to cheap tier
+		return 1
 	}
 	defer resp.Body.Close()
 
 	var result struct {
 		Complexity string `json:"complexity"`
-		Intent     string `json:"intent"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return 1
@@ -300,20 +329,21 @@ func (m *Monitor) classifyTier(errorText string) int {
 	return 1
 }
 
-func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string) {
+func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string, start time.Time) {
+	tier := "tier1"
 	fmt.Printf("[triage] Tier-1 LLM fix for %s via gateway\n", bucket.Service)
+	metricDispatches.WithLabelValues(m.repo.Name, bucket.Service, tier).Inc()
+	metricLastDispatch.WithLabelValues(m.repo.Name, bucket.Service).SetToCurrentTime()
 
 	gatewayURL := m.cfg.GatewayURL
 	if gatewayURL == "" {
-		fmt.Println("[triage] no gateway_url configured, skipping Tier-1")
-		m.runTier2(bucket, prompt)
+		fmt.Println("[triage] no gateway_url configured, escalating to Tier-2")
+		m.runTier2(bucket, prompt, start)
 		return
 	}
 
-	model := m.cfg.Model // empty = gateway router picks cheapest
-
 	payload, _ := json.Marshal(map[string]interface{}{
-		"model": model,
+		"model": m.cfg.Model,
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
@@ -326,7 +356,7 @@ func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string) {
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("[triage] Tier-1 gateway error: %v — escalating to Tier-2\n", err)
-		m.runTier2(bucket, prompt)
+		m.runTier2(bucket, prompt, start)
 		return
 	}
 	defer resp.Body.Close()
@@ -334,7 +364,7 @@ func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string) {
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		fmt.Printf("[triage] Tier-1 gateway %d — escalating to Tier-2\n", resp.StatusCode)
-		m.runTier2(bucket, prompt)
+		m.runTier2(bucket, prompt, start)
 		return
 	}
 
@@ -344,23 +374,25 @@ func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string) {
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil || len(result.Content) == 0 {
-		m.runTier2(bucket, prompt)
+		m.runTier2(bucket, prompt, start)
 		return
 	}
 
 	summary := fmt.Sprintf("**Tier-1 fix** for `%s`:\n%s", bucket.Service, result.Content[0].Text)
 	m.notify(summary, "info")
-
-	// Give Tier-1 time to take effect; if service still errors Tier-2 will fire next cycle
+	metricDispatchDuration.WithLabelValues(m.repo.Name, tier).Observe(time.Since(start).Seconds())
 	fmt.Printf("[triage] Tier-1 complete for %s\n", bucket.Service)
 }
 
-func (m *Monitor) runTier2(bucket *ErrorBucket, prompt string) {
+func (m *Monitor) runTier2(bucket *ErrorBucket, prompt string, start time.Time) {
+	tier := "tier2"
 	agentCmd := m.cfg.Dispatch.AgentCmd
 	if agentCmd == "" {
 		agentCmd = "claude"
 	}
 	fmt.Printf("[triage] Tier-2 agentic fix for %s via %s\n", bucket.Service, agentCmd)
+	metricDispatches.WithLabelValues(m.repo.Name, bucket.Service, tier).Inc()
+	metricLastDispatch.WithLabelValues(m.repo.Name, bucket.Service).SetToCurrentTime()
 
 	cmd := exec.Command(agentCmd, "-p", prompt,
 		"--allowedTools", "Bash,Read,Edit,Write",
@@ -373,6 +405,7 @@ func (m *Monitor) runTier2(bucket *ErrorBucket, prompt string) {
 		summary += fmt.Sprintf("\n(exit: %v)", err)
 	}
 	m.notify(summary, "error")
+	metricDispatchDuration.WithLabelValues(m.repo.Name, tier).Observe(time.Since(start).Seconds())
 }
 
 // ── Discord notification ──────────────────────────────────────────────────────
@@ -385,7 +418,7 @@ func (m *Monitor) notify(text, level string) {
 		return
 	}
 
-	color := 0x57F287 // green
+	color := 0x57F287
 	switch level {
 	case "warn":
 		color = 0xFEE75C
@@ -426,7 +459,7 @@ func (m *Monitor) Watch() {
 	if composePath == "" {
 		composePath = "docker-compose.yml"
 	}
-	args := []string{"compose", "-f", composePath, "logs", "-f", "--no-log-prefix", "--timestamps"}
+	args := []string{"compose", "-f", composePath, "logs", "-f", "--tail", "0"}
 	cmd := exec.Command("docker", args...)
 	cmd.Dir = m.repo.Path
 
@@ -442,7 +475,6 @@ func (m *Monitor) Watch() {
 		return
 	}
 
-	// Accumulate lines per service for context window
 	pending := make(map[string]*ErrorBucket)
 	flush := time.NewTicker(5 * time.Second)
 	defer flush.Stop()
@@ -479,24 +511,44 @@ func (m *Monitor) Watch() {
 }
 
 func (m *Monitor) processLine(raw string, pending map[string]*ErrorBucket) {
-	// Format: "2026-05-27T12:00:00Z service-name  | message"
-	// Strip leading timestamp if present
+	// docker compose logs format (no flags): "service-1  | message"
+	// with --timestamps: "2026-05-27T12:00:00.000000000Z service-1  | message"
 	line := raw
+
+	// Strip leading RFC3339Nano timestamp
 	if len(line) > 30 && line[10] == 'T' {
-		if idx := strings.Index(line, " "); idx > 0 {
+		if idx := strings.IndexByte(line, ' '); idx > 10 && idx < 40 {
 			line = line[idx+1:]
 		}
 	}
 
-	// Parse "service  | message"
+	// Parse service name from "service-1  | message" or "service-1 | message"
 	service := "unknown"
 	message := line
-	if idx := strings.Index(line, " | "); idx > 0 {
-		service = strings.TrimSpace(line[:idx])
-		message = line[idx+3:]
-	} else if idx := strings.Index(line, "  | "); idx > 0 {
-		service = strings.TrimSpace(line[:idx])
+	var rawSvc string
+	if idx := strings.Index(line, "  | "); idx > 0 {
+		rawSvc = strings.TrimSpace(line[:idx])
 		message = line[idx+4:]
+	} else if idx := strings.Index(line, " | "); idx > 0 {
+		rawSvc = strings.TrimSpace(line[:idx])
+		message = line[idx+3:]
+	}
+	// Strip container numeric suffix: "gateway-go-1" → "gateway-go"
+	if rawSvc != "" {
+		if i := strings.LastIndexByte(rawSvc, '-'); i > 0 {
+			suffix := rawSvc[i+1:]
+			allDigits := len(suffix) > 0
+			for _, c := range suffix {
+				if c < '0' || c > '9' {
+					allDigits = false
+					break
+				}
+			}
+			if allDigits {
+				rawSvc = rawSvc[:i]
+			}
+		}
+		service = rawSvc
 	}
 
 	if !m.matchRe.MatchString(message) {
@@ -510,6 +562,7 @@ func (m *Monitor) processLine(raw string, pending map[string]*ErrorBucket) {
 	}
 
 	fmt.Printf("[triage:%s] caught: %s\n", m.repo.Name, message)
+	metricErrorsCaught.WithLabelValues(m.repo.Name, service).Inc()
 
 	bucket, ok := pending[service]
 	if !ok {
@@ -565,22 +618,6 @@ dispatch:
   min_interval_secs: 30
   escalate_after_secs: 60
   dry_run: false
-
-template: |
-  You are an autonomous repair agent for a containerized service stack.
-
-  SERVICE: {{"{{"}}{{".Service"}}{{"}}"}}
-  REPO: {{"{{"}}{{".RepoPath"}}{{"}}"}}
-  TIME: {{"{{"}}{{".Timestamp"}}{{"}}"}}
-
-  RECENT LOG ERRORS:
-  {{"{{"}}{{".ErrorLines"}}{{"}}"}}
-
-  TASK:
-  1. Diagnose the root cause of the error above.
-  2. Apply the minimal fix.
-  3. Verify the fix.
-  4. Print a one-paragraph summary of what you changed.
 `, wd)
 
 	if err := os.WriteFile("triage.yaml", []byte(example), 0644); err != nil {
@@ -590,13 +627,27 @@ template: |
 	fmt.Println("Created triage.yaml — edit repos[] and notifications before running `triage watch`.")
 }
 
-func cmdWatch(cfgPath string) {
+func cmdWatch(cfgPath, metricsAddr string) {
 	cfg := loadConfig(cfgPath)
 
 	if len(cfg.Repos) == 0 {
 		fmt.Println("No repos configured. Add repos[] to triage.yaml.")
 		os.Exit(1)
 	}
+
+	// Start metrics server
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(200)
+			fmt.Fprint(w, `{"status":"ok"}`)
+		})
+		fmt.Printf("[triage] metrics at http://%s/metrics\n", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			fmt.Printf("[triage] metrics server error: %v\n", err)
+		}
+	}()
 
 	var wg sync.WaitGroup
 	for _, repo := range cfg.Repos {
@@ -621,7 +672,7 @@ func cmdWatch(cfgPath string) {
 
 func cmdTest(cfgPath string) {
 	cfg := loadConfig(cfgPath)
-	if cfg.Repos == nil || len(cfg.Repos) == 0 {
+	if len(cfg.Repos) == 0 {
 		fmt.Println("No repos in config.")
 		os.Exit(1)
 	}
@@ -649,7 +700,6 @@ func loadConfig(path string) Config {
 		fmt.Printf("cannot parse %s: %v\n", path, err)
 		os.Exit(1)
 	}
-	// Env overrides
 	if v := os.Getenv("TRIAGE_GATEWAY_URL"); v != "" {
 		cfg.GatewayURL = v
 	}
@@ -668,7 +718,7 @@ func usage() {
 	fmt.Printf(`TriageAI %s — autonomous log monitor and repair agent
 
 USAGE:
-  triage [--config PATH] <command>
+  triage [--config PATH] [--metrics-addr ADDR] <command>
 
 COMMANDS:
   init    Create a starter triage.yaml in the current directory
@@ -676,8 +726,9 @@ COMMANDS:
   test    Send a test Discord notification
 
 FLAGS:
-  --config PATH   Path to config file (default: triage.yaml)
-  --version       Print version
+  --config PATH          Path to config file (default: triage.yaml)
+  --metrics-addr ADDR    Prometheus metrics listen address (default: 127.0.0.1:9112)
+  --version              Print version
 
 ENVIRONMENT:
   TRIAGE_GATEWAY_URL       Override gateway_url from config
@@ -689,15 +740,20 @@ ENVIRONMENT:
 
 func main() {
 	cfgPath := "triage.yaml"
+	metricsAddr := "127.0.0.1:9112"
 	args := os.Args[1:]
 
-	// Parse flags
 	var filtered []string
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--config", "-config":
 			if i+1 < len(args) {
 				cfgPath = args[i+1]
+				i++
+			}
+		case "--metrics-addr", "-metrics-addr":
+			if i+1 < len(args) {
+				metricsAddr = args[i+1]
 				i++
 			}
 		case "--version", "-version":
@@ -721,7 +777,7 @@ func main() {
 	case "init":
 		cmdInit()
 	case "watch":
-		cmdWatch(cfgPath)
+		cmdWatch(cfgPath, metricsAddr)
 	case "test":
 		cmdTest(cfgPath)
 	default:
