@@ -1,0 +1,87 @@
+# TriageAI configuration example
+# Copy to triage.yaml and edit for your stack.
+
+# Gateway URL for LLM routing (Tier 1 + Tier 2 classification)
+# Leave empty to call LLMs directly.
+gateway_url: "http://localhost:7878"
+
+# Default model for Tier 1 fixes. Empty string = let the gateway router pick the
+# cheapest adequate model (e.g. Gemini Flash or Haiku).
+model: ""
+
+# Repos to monitor — each gets its own docker compose log stream.
+repos:
+  - path: /your/project
+    name: my-stack
+    compose_file: docker-compose.yml   # relative to path; default: docker-compose.yml
+
+# Log line filtering
+filters:
+  match:
+    - "WARN"
+    - "WARNING"
+    - "ERROR"
+    - "FATAL"
+    - "panic:"
+    - "CRIT"
+  skip:
+    - "task queue depth"
+    - "Redis index race"
+    - "keyword_search"
+    - "DeadlineExceeded"
+    - "stream copy"
+    - "no changes to commit"
+
+# Optional Discord webhook for fix summaries
+notifications:
+  discord_webhook: ""
+
+dispatch:
+  # Tier 0 — pattern → shell command (no LLM)
+  patterns:
+    - match: "401|authentication_error|auth_failed"
+      action: "make refresh-token"   # run in repo path
+    - match: "ENOSPC|no space left"
+      action: "docker system prune -f"
+
+  # Tier 1 — cheap LLM call via gateway (non-interactive)
+  # gateway_url and model inherited from top-level if omitted here
+
+  # Tier 2 — agentic claude -p with tool use (for complex fixes)
+  intent_url: "http://localhost:8765/classify-intent"   # optional; routes T1 vs T2
+  agent_cmd: "claude"                                    # path to claude CLI
+
+  # Timing
+  debounce_secs: 120    # re-fire window per fingerprint
+  min_interval_secs: 30 # minimum gap between any two dispatches
+  escalate_after_secs: 60  # wait for Tier 1 before escalating to Tier 2
+  dry_run: false
+
+# Go-template prompt sent to the LLM. Variables:
+#   {{.Service}}    - container/service name
+#   {{.RepoPath}}   - absolute path to the repo
+#   {{.RepoName}}   - friendly name from config
+#   {{.ErrorLines}} - last N error log lines
+#   {{.Timestamp}}  - UTC timestamp of first occurrence
+template: |
+  You are an autonomous repair agent for a containerized service stack.
+
+  SERVICE: {{.Service}}
+  REPO: {{.RepoPath}}
+  TIME: {{.Timestamp}}
+
+  RECENT LOG ERRORS:
+  {{.ErrorLines}}
+
+  TASK:
+  1. Diagnose the root cause of the error above.
+  2. Apply the minimal fix (edit files, update config, restart the service via
+     `docker compose restart {{.Service}}`).
+  3. Verify the fix (check service health, tail logs briefly).
+  4. Print a one-paragraph summary of what you found and what you changed — this
+     will be posted to the team channel.
+
+  Constraints:
+  - Do NOT force-push, drop databases, or delete volumes.
+  - If the fix requires a secret you do not have, say so and stop.
+  - Prefer `docker compose restart` over full `up -d` unless dependencies changed.
