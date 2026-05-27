@@ -37,6 +37,18 @@ var (
 		Help: "Total repair dispatches, by repo, service and tier (tier0/tier1/tier2).",
 	}, []string{"repo", "service", "tier"})
 
+	// outcome = "success" | "failure" | "escalated" (tier1 fell through to tier2)
+	metricDispatchOutcomes = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "triageai_dispatch_outcomes_total",
+		Help: "Dispatch outcomes by repo, service, tier, and outcome (success/failure/escalated).",
+	}, []string{"repo", "service", "tier", "outcome"})
+
+	// error_type extracted from the matched log line (auth/oom/crash/timeout/other)
+	metricErrorsByType = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "triageai_errors_by_type_total",
+		Help: "Caught errors classified by type (auth/oom/crash/timeout/other), by repo and service.",
+	}, []string{"repo", "service", "error_type"})
+
 	metricDispatchDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "triageai_dispatch_duration_seconds",
 		Help:    "Time from error detection to dispatch completion.",
@@ -221,6 +233,29 @@ func fingerprint(service, line string) string {
 	return service + "|" + line
 }
 
+var (
+	reAuth    = regexp.MustCompile(`(?i)401|auth(entication)?[_\s]?(error|fail)|invalid.*(key|token|credential)`)
+	reOOM     = regexp.MustCompile(`(?i)ENOSPC|no space left|out.of.memory|OOM|killed`)
+	reCrash   = regexp.MustCompile(`(?i)panic:|fatal|segfault|SIGSEGV|exit status [^0]`)
+	reTimeout = regexp.MustCompile(`(?i)timeout|deadline.*exceeded|context canceled`)
+)
+
+func classifyErrorType(lines []string) string {
+	joined := strings.Join(lines, " ")
+	switch {
+	case reAuth.MatchString(joined):
+		return "auth"
+	case reOOM.MatchString(joined):
+		return "oom"
+	case reCrash.MatchString(joined):
+		return "crash"
+	case reTimeout.MatchString(joined):
+		return "timeout"
+	default:
+		return "other"
+	}
+}
+
 func (m *Monitor) deduped(service, line string) bool {
 	fp := fingerprint(service, line)
 	debounce := time.Duration(m.cfg.Dispatch.DebounceSecs) * time.Second
@@ -262,10 +297,13 @@ func (m *Monitor) dispatch(bucket *ErrorBucket) {
 				cmd := exec.Command("sh", "-c", action)
 				cmd.Dir = m.repo.Path
 				out, err := cmd.CombinedOutput()
+				outcome := "success"
 				summary := fmt.Sprintf("Tier-0 pattern fix for %s:\n```\n%s\n```", bucket.Service, string(out))
 				if err != nil {
+					outcome = "failure"
 					summary += fmt.Sprintf("\n(exit error: %v)", err)
 				}
+				metricDispatchOutcomes.WithLabelValues(m.repo.Name, bucket.Service, tier, outcome).Inc()
 				m.notify(summary, "warn")
 			}
 			metricDispatchDuration.WithLabelValues(m.repo.Name, tier).Observe(time.Since(start).Seconds())
@@ -356,6 +394,7 @@ func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string, start time.Time) 
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		fmt.Printf("[triage] Tier-1 gateway error: %v — escalating to Tier-2\n", err)
+		metricDispatchOutcomes.WithLabelValues(m.repo.Name, bucket.Service, tier, "escalated").Inc()
 		m.runTier2(bucket, prompt, start)
 		return
 	}
@@ -364,6 +403,7 @@ func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string, start time.Time) 
 	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != 200 {
 		fmt.Printf("[triage] Tier-1 gateway %d — escalating to Tier-2\n", resp.StatusCode)
+		metricDispatchOutcomes.WithLabelValues(m.repo.Name, bucket.Service, tier, "escalated").Inc()
 		m.runTier2(bucket, prompt, start)
 		return
 	}
@@ -374,10 +414,12 @@ func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string, start time.Time) 
 		} `json:"content"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil || len(result.Content) == 0 {
+		metricDispatchOutcomes.WithLabelValues(m.repo.Name, bucket.Service, tier, "escalated").Inc()
 		m.runTier2(bucket, prompt, start)
 		return
 	}
 
+	metricDispatchOutcomes.WithLabelValues(m.repo.Name, bucket.Service, tier, "success").Inc()
 	summary := fmt.Sprintf("**Tier-1 fix** for `%s`:\n%s", bucket.Service, result.Content[0].Text)
 	m.notify(summary, "info")
 	metricDispatchDuration.WithLabelValues(m.repo.Name, tier).Observe(time.Since(start).Seconds())
@@ -400,10 +442,13 @@ func (m *Monitor) runTier2(bucket *ErrorBucket, prompt string, start time.Time) 
 	cmd.Dir = m.repo.Path
 
 	out, err := cmd.CombinedOutput()
+	outcome := "success"
 	summary := fmt.Sprintf("**Tier-2 agent fix** for `%s`:\n%s", bucket.Service, string(out))
 	if err != nil {
+		outcome = "failure"
 		summary += fmt.Sprintf("\n(exit: %v)", err)
 	}
+	metricDispatchOutcomes.WithLabelValues(m.repo.Name, bucket.Service, tier, outcome).Inc()
 	m.notify(summary, "error")
 	metricDispatchDuration.WithLabelValues(m.repo.Name, tier).Observe(time.Since(start).Seconds())
 }
@@ -563,6 +608,7 @@ func (m *Monitor) processLine(raw string, pending map[string]*ErrorBucket) {
 
 	fmt.Printf("[triage:%s] caught: %s\n", m.repo.Name, message)
 	metricErrorsCaught.WithLabelValues(m.repo.Name, service).Inc()
+	metricErrorsByType.WithLabelValues(m.repo.Name, service, classifyErrorType([]string{message})).Inc()
 
 	bucket, ok := pending[service]
 	if !ok {
