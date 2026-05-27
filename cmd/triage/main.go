@@ -705,6 +705,9 @@ func loadConfig(path string) Config {
 	}
 	if v := os.Getenv("TRIAGE_DISCORD_WEBHOOK"); v != "" {
 		cfg.Notifications.DiscordWebhook = v
+	} else if v := os.Getenv("DISCORD_WEBHOOK_URL"); v != "" {
+		// Fall back to the shared Gabagool env var so you only need one secret
+		cfg.Notifications.DiscordWebhook = v
 	}
 	if os.Getenv("TRIAGE_DRY_RUN") == "1" {
 		cfg.Dispatch.DryRun = true
