@@ -213,7 +213,7 @@ func newMonitor(cfg Config, repo RepoConfig) (*Monitor, error) {
 		patternRes: patternRes,
 		seen:       make(map[string]time.Time),
 		tmpl:       tmpl,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		httpClient: &http.Client{Timeout: 90 * time.Second},
 	}, nil
 }
 
@@ -380,13 +380,16 @@ func (m *Monitor) runTier1(bucket *ErrorBucket, prompt string, start time.Time) 
 		return
 	}
 
-	payload, _ := json.Marshal(map[string]interface{}{
-		"model": m.cfg.Model,
+	reqBody := map[string]interface{}{
 		"messages": []map[string]string{
 			{"role": "user", "content": prompt},
 		},
 		"max_tokens": 1024,
-	})
+	}
+	if m.cfg.Model != "" {
+		reqBody["model"] = m.cfg.Model
+	}
+	payload, _ := json.Marshal(reqBody)
 
 	req, _ := http.NewRequest("POST", gatewayURL+"/v1/messages", bytes.NewReader(payload))
 	req.Header.Set("Content-Type", "application/json")
